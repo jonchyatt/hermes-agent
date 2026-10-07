@@ -752,6 +752,25 @@ def connect_closing(db_path: Optional[Path] = None, *, board: Optional[str] = No
             conn.close()
 
 
+@contextlib.contextmanager
+def connect_readonly(db_path: Optional[Path] = None, *, board: Optional[str] = None):
+    """Open a resolved board read-only for snapshot/doctor work.
+
+    SQLite may checkpoint a WAL when a normal read-write connection closes. A
+    true ``mode=ro`` connection prevents that side effect while still exposing
+    committed WAL frames to the online backup API.
+    """
+    path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    uri = f"file:{path.resolve().as_posix()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        yield conn
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
 def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> Path:
     """Create the schema if it doesn't exist; return the path used. Unlike
     :func:`connect`'s cached first-time auto-init, this always re-runs the

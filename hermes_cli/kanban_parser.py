@@ -144,6 +144,7 @@ _BOARD_SPECS = [
         "NEW board — the slug gains a numeric suffix if it is already taken — so an import can "
         "never overwrite or merge into a board you already have."
     )),
+    _cmd("doctor", [_json_flag()], help="Verify every board with a WAL-safe snapshot and disposable restore"),
 ]
 
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.

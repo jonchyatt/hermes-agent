@@ -201,6 +201,17 @@ def _cmd_boards_import(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_boards_doctor(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_snapshot
+    result = kanban_snapshot.doctor()
+    if _json_out(args, result):
+        return 0 if result["ok"] else 1
+    for board in result["boards"]:
+        print(f"{board['board']}: {board['status']}")
+    print(f"\n{result['passed']}/{result['count']} boards passed snapshot/restore checks.")
+    return 0 if result["ok"] else 1
+
+
 _BOARD_HANDLERS = {
     "list": _cmd_boards_list, "ls": _cmd_boards_list,
     "create": _cmd_boards_create, "new": _cmd_boards_create,
@@ -211,4 +222,5 @@ _BOARD_HANDLERS = {
     "set-default-workdir": _cmd_boards_set_default_workdir,
     "export": _cmd_boards_export,
     "import": _cmd_boards_import,
+    "doctor": _cmd_boards_doctor,
 }
