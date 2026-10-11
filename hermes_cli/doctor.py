@@ -106,6 +106,37 @@ def _check_api_connectivity(should_fix: bool, f: Finding) -> None:
             f.issues.extend(r.issues)
 
 
+@doctor_check()
+def _check_kanban_boards(should_fix: bool, f: Finding) -> None:
+    """Read-only snapshot/restore health for every configured Kanban board.
+
+    This deliberately reports WAL state per board instead of collapsing it into a
+    single count: WAL-backed boards need the runtime's fixed SQLite build, while
+    snapshot/restore failures need immediate board-level remediation.
+    """
+    with warn_on_error("Kanban board safety", "(could not check: {e})"):
+        from hermes_cli import kanban_snapshot
+        result = kanban_snapshot.doctor()
+        boards = result.get("boards", [])
+        if not boards:
+            check_info("Kanban boards: none discovered")
+            return
+        print(f"  Kanban boards: {result.get('passed', 0)}/{result.get('count', len(boards))} snapshot/restore checks passed")
+        for board in boards:
+            slug = board.get("board", "?")
+            if board.get("status") == "missing":
+                print(f"  ⚠ {slug}: missing database — restore the board before scheduling work")
+                f.issues.append(f"Kanban board {slug} is missing")
+                continue
+            mode = board.get("source_journal_mode", "unknown")
+            status = board.get("status", "fail").upper()
+            print(f"  {'✓' if status == 'PASS' else '✗'} {slug}: journal_mode={mode}; snapshot/restore={status}")
+            if status != "PASS":
+                f.issues.append(f"Kanban board {slug} snapshot/restore failed — inspect the board before writing")
+            elif mode == "wal":
+                check_info(f"{slug}: WAL is active; keep the Hermes runtime on a SQLite build with the WAL-reset fix")
+
+
 # Ordered (section title, check). None title = check prints its own header (or none); order is user-visible.
 DOCTOR_CHECKS = (
     ('Security Advisories', _check_security_advisories), ('MCP Server Security', _check_mcp_security),
@@ -118,6 +149,7 @@ DOCTOR_CHECKS = (
     (None, _check_gateway_supervision), (None, _check_command_installation),
     ('External Tools', _check_git_and_rg), (None, _check_terminal_backend), (None, _check_node_and_browser),
     (None, _check_npm_audit), ('API Connectivity', _check_api_connectivity),
+    ('Kanban Board Safety', _check_kanban_boards),
     ('Tool Availability', _check_tool_availability), ('Skills Hub', _check_skills_hub),
     ('Memory Provider', _check_memory_provider), (None, _check_profiles),
 )

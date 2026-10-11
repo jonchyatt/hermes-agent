@@ -60,6 +60,7 @@ def snapshot_board(board: str, destination: str | Path) -> dict[str, Any]:
     before = source_path.stat()
     with kbc.connect_readonly(board=slug) as source, contextlib.closing(sqlite3.connect(str(destination))) as target:
         source_stats = _task_stats(source)
+        source_journal_mode = str(source.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         source.backup(target)
         target.commit()
         backup_stats = _task_stats(target)
@@ -69,6 +70,7 @@ def snapshot_board(board: str, destination: str | Path) -> dict[str, Any]:
         "source": str(source_path),
         "destination": str(destination),
         "source_stats": source_stats,
+        "source_journal_mode": source_journal_mode,
         "backup_stats": backup_stats,
         "integrity": integrity_check(destination),
         "source_mtime_unchanged": (before.st_mtime_ns, before.st_size) == (after.st_mtime_ns, after.st_size),

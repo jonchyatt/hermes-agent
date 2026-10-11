@@ -438,7 +438,7 @@ def _resolve_repo_dir() -> Optional[Path]:
 
 
 def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
-    """Return upstream/local git hashes for the startup banner.
+    """Return running-checkout and origin/main provenance for the startup banner.
 
     Cached per-process (default ``repo_dir`` only): 2-3 git subprocesses (~100ms) whose result
     cannot change under a running CLI. The cache lets ``prefetch_banner_data()`` pay it off-thread.
@@ -454,7 +454,7 @@ def _baked_banner_state() -> Optional[dict]:
         from hermes_cli.build_info import get_build_sha
         return get_build_sha(short=8)
     baked = _quiet(_baked)
-    return {"upstream": baked, "local": baked, "ahead": 0} if baked else None
+    return {"upstream": baked, "local": baked, "release_tag": None, "ahead": 0} if baked else None
 
 
 def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
@@ -465,8 +465,13 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
     if not upstream or not local:
         # Live-git lookup failed (e.g. shallow clone without origin/main).
         return _baked_banner_state()
+    # ``origin/main`` is provenance for the remote-tracking ref, not necessarily the
+    # commit that is running. Only call a checkout a release when HEAD is exactly on
+    # a tag; the nearest tag would mislabel an ahead-of-release development checkout.
+    release_tag = _git_stdout(["describe", "--tags", "--exact-match"], cwd=repo_dir)
     ahead = _git_count(["rev-list", "--count", "origin/main..HEAD"], cwd=repo_dir) or 0
-    return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
+    return {"upstream": upstream, "local": local, "release_tag": release_tag,
+            "ahead": max(ahead, 0)}
 
 
 _RELEASE_URL_BASE = "https://github.com/NousResearch/hermes-agent/releases/tag"
@@ -491,7 +496,10 @@ def format_banner_version_label() -> str:
     if not state:
         return base
     upstream, local = state["upstream"], state["local"]
+    release_tag = state.get("release_tag")
     ahead = int(state.get("ahead") or 0)
+    if release_tag:
+        return f"{base} · running {release_tag} ({local}) · origin/main {upstream}"
     if ahead <= 0 or upstream == local:
         return f"{base} · upstream {upstream}"
     return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {_plural(ahead, 'commit')})"

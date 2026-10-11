@@ -38,6 +38,65 @@ def test_check_via_local_git_ssh_fastpath_ahead_not_behind(tmp_path):
     assert behind == 0
 
 
+def _banner_git_fixture(tmp_path, *, upstream, local, release_tag=None, ahead=0):
+    from hermes_cli import banner
+
+    repo_dir = tmp_path / "repo"
+    (repo_dir / ".git").mkdir(parents=True)
+
+    def fake_git_stdout(args, *, cwd, timeout=5, network=False):
+        values = {
+            ("rev-parse", "--short=8", "origin/main"): upstream,
+            ("rev-parse", "--short=8", "HEAD"): local,
+            ("describe", "--tags", "--exact-match"): release_tag,
+        }
+        return values.get(tuple(args))
+
+    with patch.object(banner, "_git_stdout", side_effect=fake_git_stdout), \
+            patch.object(banner, "_git_count", return_value=ahead):
+        return banner._compute_git_banner_state(repo_dir), banner
+
+
+def test_git_banner_state_release_tag_separates_running_checkout_from_origin(tmp_path):
+    state, _ = _banner_git_fixture(tmp_path, upstream="749220ef", local="f97608f1",
+                                   release_tag="v2026.9.24")
+
+    assert state == {"upstream": "749220ef", "local": "f97608f1",
+                     "release_tag": "v2026.9.24", "ahead": 0}
+
+
+def test_git_banner_state_ahead_of_upstream_does_not_use_nearest_release_tag(tmp_path):
+    state, banner = _banner_git_fixture(tmp_path, upstream="aaaa1111", local="bbbb2222",
+                                        ahead=2)
+    with patch.object(banner, "get_git_banner_state", return_value=state):
+        label = banner.format_banner_version_label()
+
+    assert "running" not in label
+    assert "upstream aaaa1111" in label
+    assert "local bbbb2222 (+2 carried commits)" in label
+
+
+def test_git_banner_state_divergent_remote_does_not_present_remote_as_running(tmp_path):
+    state, banner = _banner_git_fixture(tmp_path, upstream="1111aaaa", local="2222bbbb")
+    with patch.object(banner, "get_git_banner_state", return_value=state):
+        label = banner.format_banner_version_label()
+
+    assert label.endswith("upstream 1111aaaa")
+    assert "running 1111aaaa" not in label
+    assert "2222bbbb" not in label
+
+
+def test_git_banner_state_without_git_uses_baked_provenance():
+    from hermes_cli import banner
+
+    baked = {"upstream": "buildsha1", "local": "buildsha1", "release_tag": None, "ahead": 0}
+    with patch.object(banner, "_resolve_repo_dir", return_value=None), \
+            patch.object(banner, "_baked_banner_state", return_value=baked):
+        state = banner._compute_git_banner_state()
+
+    assert state == baked
+
+
 def test_check_via_local_git_ssh_fastpath_genuinely_behind(tmp_path):
     """SSH fast path reports the exact count (compare API) when behind."""
 
