@@ -283,6 +283,81 @@ class TestWorkerSpawnEnv:
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(expected_ws)
 
 
+class TestWorkerCitedContext:
+    def _task(self):
+        return kb.Task(
+            id="t_context",
+            title="login green",
+            body="Exact body stays in the Kanban card.",
+            assignee="context-profile",
+            status="ready",
+            priority=0,
+            created_by="user",
+            created_at=0,
+            started_at=None,
+            completed_at=None,
+            workspace_kind="scratch",
+            workspace_path=None,
+            claim_lock=None,
+            claim_expires=None,
+            tenant=None,
+        )
+
+    def test_opt_in_prelude_is_bounded_cited_and_excludes_l1_map(self, fresh_home, monkeypatch):
+        profile_home = fresh_home / "profiles" / "context-profile"
+        profile_home.mkdir(parents=True)
+        (profile_home / "cited-context-prelude.json").write_text(json.dumps({
+            "enabled": True,
+            "endpoint": "http://127.0.0.1:9335/context",
+            "maxResults": 3,
+            "maxPreludeBytes": 512,
+        }), encoding="utf-8")
+
+        class Response:
+            status = 200
+
+            def read(self, _limit):
+                return json.dumps({
+                    "closedMiss": False,
+                    "citations": [
+                        {"path": "data/memory-tiers/MAP.md", "line": 5, "excerpt": "routing only"},
+                        {"path": "memory/rulings/green.md", "line": 7, "excerpt": "real evidence"},
+                    ],
+                }).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(kbd, "urlopen", lambda *_args, **_kwargs: Response())
+        prompt, state, citations = kbd._worker_cited_context(self._task(), str(profile_home))
+
+        assert state == "hit"
+        assert citations == ["memory/rulings/green.md:7"]
+        assert prompt is not None
+        assert "data/memory-tiers/MAP.md" not in prompt
+        assert "work kanban task t_context" in prompt
+        assert len(prompt.encode("utf-8")) <= 4096 + 512
+
+    def test_unavailable_memory_fails_open_to_original_worker_prompt(self, fresh_home, monkeypatch):
+        profile_home = fresh_home / "profiles" / "context-profile"
+        profile_home.mkdir(parents=True)
+        (profile_home / "cited-context-prelude.json").write_text(json.dumps({
+            "enabled": True,
+            "endpoint": "http://127.0.0.1:9335/context",
+        }), encoding="utf-8")
+        monkeypatch.setattr(kbd, "urlopen", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("offline")))
+
+        prompt, state, citations = kbd._worker_cited_context(self._task(), str(profile_home))
+        argv = kbd._worker_argv(self._task(), "context-profile", str(profile_home), initial_prompt=prompt)
+
+        assert state == "unavailable"
+        assert citations == []
+        assert argv[-1] == "work kanban task t_context"
+
+
 # ---------------------------------------------------------------------------
 # CLI surface
 # ---------------------------------------------------------------------------

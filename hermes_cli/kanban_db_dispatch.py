@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -15,6 +16,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+from urllib.parse import urlencode
+from urllib.request import urlopen
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -2673,7 +2676,13 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
+def _worker_argv(
+    task: Task,
+    profile_arg: str,
+    hermes_home: Optional[str],
+    *,
+    initial_prompt: Optional[str] = None,
+) -> list[str]:
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
     cmd = [
         *_resolve_hermes_argv(),
@@ -2704,10 +2713,77 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    cmd.extend(["chat", "-q", initial_prompt or f"work kanban task {task.id}"])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd
+
+
+def _worker_cited_context(task: Task, hermes_home: Optional[str]) -> tuple[Optional[str], str, list[str]]:
+    """Build an opt-in, bounded cited prelude from the local memory context API.
+
+    A profile opts in by carrying ``cited-context-prelude.json``.  The Kanban
+    card body is never modified: unavailable memory leaves the exact original
+    ``work kanban task <id>`` startup prompt in place.
+    """
+    if not hermes_home:
+        return None, "disabled", []
+    try:
+        raw_config = json.loads((Path(hermes_home) / "cited-context-prelude.json").read_text("utf-8"))
+    except FileNotFoundError:
+        return None, "disabled", []
+    except Exception:
+        return None, "unavailable", []
+    if raw_config.get("enabled") is not True:
+        return None, "disabled", []
+
+    endpoint = raw_config.get("endpoint")
+    if not isinstance(endpoint, str) or not endpoint.startswith("http://127.0.0.1:"):
+        return None, "unavailable", []
+    max_results = raw_config.get("maxResults", 3)
+    max_bytes = raw_config.get("maxPreludeBytes", 4096)
+    if not isinstance(max_results, int) or not 1 <= max_results <= 3:
+        return None, "unavailable", []
+    if not isinstance(max_bytes, int) or not 256 <= max_bytes <= 4096:
+        return None, "unavailable", []
+
+    # The title is the dispatcher's compact semantic label.  Appending an
+    # arbitrary long card body diluted an otherwise resolvable query into a
+    # closed miss during the real-worker proof.
+    query = (task.title or task.body or "")[:256]
+    try:
+        with urlopen(f"{endpoint}?{urlencode({'q': query, 'limit': max_results})}", timeout=3) as response:  # noqa: S310 -- profile opt-in restricts this to loopback
+            if response.status != 200:
+                return None, "unavailable", []
+            payload = json.loads(response.read(max_bytes * 4 + 1).decode("utf-8"))
+    except Exception:
+        return None, "unavailable", []
+
+    citations = []
+    for item in payload.get("citations", []):
+        path = item.get("path") if isinstance(item, dict) else None
+        line = item.get("line") if isinstance(item, dict) else None
+        excerpt = item.get("excerpt") if isinstance(item, dict) else None
+        if not isinstance(path, str) or path == "data/memory-tiers/MAP.md" or not isinstance(line, int) or line < 1 or not isinstance(excerpt, str):
+            continue
+        citations.append({"citation": f"{path}:{line}", "excerpt": excerpt[:800]})
+        if len(citations) == max_results:
+            break
+    state = "closed_miss" if payload.get("closedMiss") is True or not citations else "hit"
+    prelude = {"state": state, "routeTrace": ["L0:memory/MEMORY.md", "L2: cited leaves"], "citations": citations}
+    while len(json.dumps(prelude, ensure_ascii=False).encode("utf-8")) > max_bytes and citations:
+        citations.pop()
+    if len(json.dumps(prelude, ensure_ascii=False).encode("utf-8")) > max_bytes:
+        return None, "unavailable", []
+    prompt = "\n".join((
+        "You are receiving an opt-in machine-readable cited context prelude.",
+        "Use only its exact file:line citations when citing this prelude. Never treat the L1 tier map as factual evidence.",
+        "<HERMES_CITED_CONTEXT_PRELUDE>",
+        json.dumps(prelude, ensure_ascii=False),
+        "</HERMES_CITED_CONTEXT_PRELUDE>",
+        f"work kanban task {task.id}",
+    ))
+    return prompt, state, [item["citation"] for item in citations]
 
 
 def _open_worker_log(task: Task, board: Optional[str]):
@@ -2870,7 +2946,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    initial_prompt, cited_context_state, cited_context_citations = _worker_cited_context(
+        task, env.get("HERMES_HOME"),
+    )
+    if cited_context_state != "disabled":
+        env["HERMES_KANBAN_CITED_CONTEXT_STATE"] = cited_context_state
+        env["HERMES_KANBAN_CITED_CONTEXT_CITATIONS"] = ",".join(cited_context_citations)
+    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"), initial_prompt=initial_prompt)
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
@@ -2878,6 +2960,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     from tools.process_registry import systemd_user_bus_env
     env = systemd_user_bus_env(env)
     log_f = _open_worker_log(task, board)
+    if cited_context_state != "disabled":
+        log_f.write(
+            (
+                f"KANBAN_CITED_CONTEXT_STATE={cited_context_state}\n"
+                f"KANBAN_CITED_CONTEXT_CITATIONS={','.join(cited_context_citations) or 'none'}\n"
+            ).encode("utf-8")
+        )
+        log_f.flush()
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
